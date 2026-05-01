@@ -165,6 +165,8 @@ class GuildBattle:
     amount_required: int = 3
     allow_duplicates: bool = True
     allow_buffs: bool = True
+    author_confirmed: bool = False
+    opponent_confirmed: bool = False
     created_at: float = field(default_factory=lambda: __import__('time').time())
 
 
@@ -176,7 +178,7 @@ def gen_deck(balls, strikethrough=False) -> str:
     if strikethrough:
         deck = "\n".join(
             [
-                f"-~~ {ball.emoji} {ball.name} ATK:{ball.attack_bonus:+}% HP:{ball.health_bonus:+}%~~"
+                f"- ~~{ball.emoji} {ball.name} ATK:{ball.attack_bonus:+}% HP:{ball.health_bonus:+}%~~"
                 for ball in balls
             ]
         )
@@ -192,39 +194,95 @@ def gen_deck(balls, strikethrough=False) -> str:
         return deck[0:951] + '\n<truncated due to discord limits, rest of your balls are still here>'
     return deck
 
-def update_embed(
-    author_balls, opponent_balls, author, opponent, author_ready, opponent_ready, allow_duplicates, allow_buffs, amount_required
-) -> discord.Embed:
-    """Creates an embed for the battle setup phase."""
-    embed = discord.Embed(
-        title=f"{settings.plural_collectible_name.title()} Battle Plan",
-        description=(
-            f"Add or remove {settings.plural_collectible_name} you want to propose to the other player using the "
-            "`/battle add` and `/battle remove` commands.\n"
-            "Once you're finished, click the lock button to confirm your proposal.\n"
-            f"*You have 15 minutes before this interaction ends.*\n"
-            f"**Settings**:\n"
-            f"• Duplicates: {'Allowed' if allow_duplicates else 'Not allowed'}\n"
-            f"• Buffs: {'Allowed' if allow_buffs else 'Not allowed'}\n"
-            f"• Amount: {amount_required}"
-        ),
-        color=discord.Color.blurple(),
-    )
+async def get_battle_embed(guild_battle: "GuildBattle") -> discord.Embed:
+    """Creates the appropriate embed for the current battle state."""
+    # Try to get clickable slash command mentions
+    bot = guild_battle.interaction.client
+    add_mention = "`/battle add`"
+    remove_mention = "`/battle remove`"
+    
+    try:
+        for cmd in await bot.tree.fetch_commands():
+            if cmd.name == "battle":
+                for sub in cmd.options:
+                    if sub.name == "add":
+                        add_mention = f"</{cmd.name} {sub.name}:{cmd.id}>"
+                    elif sub.name == "remove":
+                        remove_mention = f"</{cmd.name} {sub.name}:{cmd.id}>"
+                break
+    except Exception as e:
+        log.error(f"Failed to fetch command mentions: {e}")
 
-    author_emoji = "🔒" if author_ready else ""
-    opponent_emoji = "🔒" if opponent_ready else ""
+    if guild_battle.author_confirmed or guild_battle.opponent_confirmed:
+        # One or both have confirmed to start the battle
+        embed = discord.Embed(
+            title=f"{settings.plural_collectible_name.title()} Battle Plan",
+            description="Both users have locked their propositions! Now confirm to begin the battle.",
+            color=discord.Color(0xfee65c),
+        )
+        author_emoji = "✅" if guild_battle.author_confirmed else "🔒"
+        opponent_emoji = "✅" if guild_battle.opponent_confirmed else "🔒"
+        
+        embed.add_field(
+            name=f"{author_emoji} {guild_battle.author.name}",
+            value=gen_deck(guild_battle.battle.p1_balls),
+            inline=True,
+        )
+        embed.add_field(
+            name=f"{opponent_emoji} {guild_battle.opponent.name}",
+            value=gen_deck(guild_battle.battle.p2_balls),
+            inline=True,
+        )
+    elif guild_battle.author_ready and guild_battle.opponent_ready:
+        # Both locked but nobody confirmed yet
+        embed = discord.Embed(
+            title=f"{settings.plural_collectible_name.title()} Battle Plan",
+            description="Both users have locked their propositions! Now confirm to begin the battle.",
+            color=discord.Color(0xfee65c),
+        )
+        embed.add_field(
+            name=f"🔒 {guild_battle.author.name}",
+            value=gen_deck(guild_battle.battle.p1_balls),
+            inline=True,
+        )
+        embed.add_field(
+            name=f"🔒 {guild_battle.opponent.name}",
+            value=gen_deck(guild_battle.battle.p2_balls),
+            inline=True,
+        )
+    else:
+        # Setup phase
+        embed = discord.Embed(
+            title=f"{settings.plural_collectible_name.title()} Battle Plan",
+            description=(
+                f"Add or remove {settings.plural_collectible_name} you want to propose to the other player using the "
+                f"{add_mention} and {remove_mention} commands.\n"
+                "Once you're finished, click the lock button to confirm your proposal.\n"
+                f"*You have 15 minutes before this interaction ends.*\n"
+                f"**Settings**:\n"
+                f"- Duplicates: {'Allowed' if guild_battle.allow_duplicates else 'Not allowed'}\n"
+                f"- Buffs: {'Allowed' if guild_battle.allow_buffs else 'Not allowed'}\n"
+                f"- Amount: {guild_battle.amount_required}"
+            ),
+            color=discord.Color.blurple(),
+        )
+        author_emoji = "🔒" if guild_battle.author_ready else ""
+        opponent_emoji = "🔒" if guild_battle.opponent_ready else ""
 
-    embed.add_field(
-        name=f"{author_emoji} {author}",
-        value=gen_deck(author_balls),
-        inline=True,
-    )
-    embed.add_field(
-        name=f"{opponent_emoji} {opponent}",
-        value=gen_deck(opponent_balls),
-        inline=True,
-    )
+        embed.add_field(
+            name=f"{author_emoji} {guild_battle.author.name}",
+            value=gen_deck(guild_battle.battle.p1_balls),
+            inline=True,
+        )
+        embed.add_field(
+            name=f"{opponent_emoji} {guild_battle.opponent.name}",
+            value=gen_deck(guild_battle.battle.p2_balls),
+            inline=True,
+        )
+
+    embed.set_footer(text="This message is updated every 15 seconds, but you can keep on editing your battle proposal.")
     return embed
+
 
 
 class ReadyView(discord.ui.View):
@@ -240,6 +298,30 @@ class ReadyView(discord.ui.View):
 
     @discord.ui.button(style=discord.ButtonStyle.success, emoji="✔️", label="")
     async def execute_battle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Safety check: battle must still be active
+        if self.guild_battle not in battles:
+            await interaction.response.send_message("This battle has already concluded or been cancelled.", ephemeral=True)
+            return
+
+        # Double click protection: check if user already confirmed
+        if (interaction.user == self.guild_battle.author and self.guild_battle.author_confirmed) or \
+           (interaction.user == self.guild_battle.opponent and self.guild_battle.opponent_confirmed):
+            await interaction.response.send_message("You have already confirmed! Waiting for the other player.", ephemeral=True)
+            return
+
+        # Update confirmation status
+        if interaction.user == self.guild_battle.author:
+            self.guild_battle.author_confirmed = True
+        elif interaction.user == self.guild_battle.opponent:
+            self.guild_battle.opponent_confirmed = True
+
+        # Check if both have confirmed
+        if not (self.guild_battle.author_confirmed and self.guild_battle.opponent_confirmed):
+            # Only one confirmed, update embed and inform
+            await interaction.response.defer()
+            await interaction.message.edit(embed=await get_battle_embed(self.guild_battle))
+            return
+
         # Execute battle logic
         battle_log = "\n".join(gen_battle(self.guild_battle.battle))
 
@@ -353,6 +435,13 @@ class ReadyView(discord.ui.View):
                 embed=embed,
                 view=cancel_view
             )
+            
+            # Stop background updates and allow others to battle
+            if self.guild_battle in battles:
+                battles.remove(self.guild_battle)
+            
+            # Stop the message update task by setting battle_message to None
+            self.guild_battle.battle_message = None
 
         try:
             await interaction.response.send_message(
@@ -361,12 +450,6 @@ class ReadyView(discord.ui.View):
             )
         except discord.errors.InteractionResponded:
             pass
-            
-        # Remove from battles list
-        battles.pop(battles.index(self.guild_battle))
-        
-        # Stop the message update task by setting battle_message to None
-        self.guild_battle.battle_message = None
 
 
 def fetch_battle(user: discord.User | discord.Member):
@@ -427,6 +510,12 @@ class BattleSetupView(discord.ui.View):
             )
             return
 
+        if (interaction.user == guild_battle.author and guild_battle.author_ready) or (
+            interaction.user == guild_battle.opponent and guild_battle.opponent_ready
+        ):
+            await interaction.response.send_message("You have already locked your proposal!", ephemeral=True)
+            return
+
         if interaction.user == guild_battle.author:
             guild_battle.author_ready = True
         elif interaction.user == guild_battle.opponent:
@@ -441,22 +530,7 @@ class BattleSetupView(discord.ui.View):
             
             new_view = ReadyView(guild_battle)
             
-            embed = discord.Embed(
-                title=f"{settings.plural_collectible_name.title()} Battle Plan",
-                description="Both users have locked their propositions! Now confirm to begin the battle.",
-                color=discord.Color(0xfee65c),
-            )
-            embed.add_field(
-                name=f"🔒 {guild_battle.author.name}",
-                value=gen_deck(guild_battle.battle.p1_balls),
-                inline=True,
-            )
-            embed.add_field(
-                name=f"🔒 {guild_battle.opponent.name}",
-                value=gen_deck(guild_battle.battle.p2_balls),
-                inline=True,
-            )
-            embed.set_footer(text="This message is updated every 15 seconds, but you can keep on editing your battle proposal.")
+            embed = await get_battle_embed(guild_battle)
             
             await interaction.response.defer()
             await interaction.message.edit(
@@ -527,17 +601,7 @@ class BattleSetupView(discord.ui.View):
 
         # Update the public battle message
         if guild_battle.battle_message:
-            embed = update_embed(
-                guild_battle.battle.p1_balls,
-                guild_battle.battle.p2_balls,
-                guild_battle.author.name,
-                guild_battle.opponent.name,
-                guild_battle.author_ready,
-                guild_battle.opponent_ready,
-                guild_battle.allow_duplicates,
-                guild_battle.allow_buffs,
-                guild_battle.amount_required,
-            )
+            embed = await get_battle_embed(guild_battle)
             await guild_battle.battle_message.edit(embed=embed)
 
         await interaction.response.send_message(
@@ -572,12 +636,12 @@ class BattleSetupView(discord.ui.View):
         )
         embed.add_field(
             name=author_name,
-            value=gen_deck(guild_battle.battle.p1_balls),
+            value=gen_deck(guild_battle.battle.p1_balls, strikethrough=bool(guild_battle.battle.p1_balls)),
             inline=True,
         )
         embed.add_field(
             name=opponent_name,
-            value=gen_deck(guild_battle.battle.p2_balls),
+            value=gen_deck(guild_battle.battle.p2_balls, strikethrough=bool(guild_battle.battle.p2_balls)),
             inline=True,
         )
         embed.set_footer(text="This message is updated every 15 seconds, but you can keep on editing your battle proposal.")
@@ -642,12 +706,12 @@ class Battle(commands.GroupCog):
                             )
                             embed.add_field(
                                 name=f"{battle.author.name}'s deck:",
-                                value=gen_deck(battle.p1_balls),
+                                value=gen_deck(battle.p1_balls, strikethrough=bool(battle.p1_balls)),
                                 inline=True,
                             )
                             embed.add_field(
                                 name=f"{battle.opponent.name}'s deck:",
-                                value=gen_deck(battle.p2_balls),
+                                value=gen_deck(battle.p2_balls, strikethrough=bool(battle.p2_balls)),
                                 inline=True,
                             )
                             embed.set_footer(text="This message is updated every 15 seconds, but you can keep on editing your battle proposal.")
@@ -719,15 +783,24 @@ class Battle(commands.GroupCog):
             )
             return
 
-        if fetch_battle(user) is not None:
+        battle_self = fetch_battle(interaction.user)
+        battle_user = fetch_battle(user)
+
+        if battle_self and battle_self == battle_user:
             await interaction.response.send_message(
-                "That user is already in a battle.", ephemeral=True,
+                "You are already in a battle with this player", ephemeral=True,
             )
             return
 
-        if fetch_battle(interaction.user) is not None:
+        if battle_self:
             await interaction.response.send_message(
                 "You are already in a battle.", ephemeral=True,
+            )
+            return
+
+        if battle_user:
+            await interaction.response.send_message(
+                "This user is already in a battle.", ephemeral=True,
             )
             return
 
@@ -738,9 +811,10 @@ class Battle(commands.GroupCog):
             )
             return
         
-        battles.append(GuildBattle(interaction, interaction.user, user, amount_required=amount, allow_duplicates=duplicates, allow_buffs=buffs))
+        guild_battle = GuildBattle(interaction, interaction.user, user, amount_required=amount, allow_duplicates=duplicates, allow_buffs=buffs)
+        battles.append(guild_battle)
 
-        embed = update_embed([], [], interaction.user.name, user.name, False, False, duplicates, buffs, amount)
+        embed = await get_battle_embed(guild_battle)
 
         view = BattleSetupView(interaction, interaction.user, user)
 
@@ -771,17 +845,7 @@ class Battle(commands.GroupCog):
                 await asyncio.sleep(15)
                 if guild_battle in battles and guild_battle.battle_message:
                     # Just edit with the same content to keep it alive
-                    embed = update_embed(
-                        guild_battle.battle.p1_balls,
-                        guild_battle.battle.p2_balls,
-                        guild_battle.author.name,
-                        guild_battle.opponent.name,
-                        guild_battle.author_ready,
-                        guild_battle.opponent_ready,
-                        guild_battle.allow_duplicates,
-                        guild_battle.allow_buffs,
-                        guild_battle.amount_required,
-                    )
+                    embed = await get_battle_embed(guild_battle)
                     await guild_battle.battle_message.edit(embed=embed)
             except (discord.NotFound, discord.Forbidden):
                 # Message was deleted or we can't edit it, stop updating
@@ -900,21 +964,8 @@ class Battle(commands.GroupCog):
                 yield False
 
         
-        # Update the public battle message
-        if guild_battle.battle_message:
-            await guild_battle.battle_message.edit(
-                embed=update_embed(
-                    guild_battle.battle.p1_balls,
-                    guild_battle.battle.p2_balls,
-                    guild_battle.author.name,
-                    guild_battle.opponent.name,
-                    guild_battle.author_ready,
-                    guild_battle.opponent_ready,
-                    guild_battle.allow_duplicates,
-                    guild_battle.allow_buffs,
-                    guild_battle.amount_required,
-                )
-            )
+        # The public battle message will be updated by the 15s task
+        pass
 
     async def remove_balls(self, interaction: discord.Interaction, countryballs):
         guild_battle = fetch_battle(interaction.user)
@@ -1011,21 +1062,8 @@ class Battle(commands.GroupCog):
                 user_balls.remove(ball)
                 yield False
 
-        # Update the public battle message
-        if guild_battle.battle_message:
-            await guild_battle.battle_message.edit(
-                embed=update_embed(
-                    guild_battle.battle.p1_balls,
-                    guild_battle.battle.p2_balls,
-                    guild_battle.author.name,
-                    guild_battle.opponent.name,
-                    guild_battle.author_ready,
-                    guild_battle.opponent_ready,
-                    guild_battle.allow_duplicates,
-                    guild_battle.allow_buffs,
-                    guild_battle.amount_required,
-                )
-            )
+        # The public battle message will be updated by the 15s task
+        pass
 
     @app_commands.command()
     async def add(
